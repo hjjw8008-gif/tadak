@@ -210,13 +210,22 @@ function randomAnimalCode() {
 
 async function readSharedData(env, includeCodes = false) {
   const studentFields = includeCodes ? "id,school,grade,room,name,animal_code,active" : "id,school,grade,room,name,active";
-  const [studentsResponse, wordsResponse] = await Promise.all([
+  const [studentsResponse, wordsResponse, schoolsResponse, classesResponse] = await Promise.all([
     supabaseApi(env, "students", `?select=${studentFields}&order=school.asc,room.asc,name.asc`),
     supabaseApi(env, "typing_words", "?select=word&active=eq.true&order=id.asc"),
+    supabaseApi(env, "schools", "?select=id,name,active&order=name.asc"),
+    supabaseApi(env, "classes", "?select=id,school_id,grade,name,active&order=grade.asc,name.asc"),
   ]);
   if (!studentsResponse.ok) throw new Error(await studentsResponse.text());
   if (!wordsResponse.ok) throw new Error(await wordsResponse.text());
-  return { students: await studentsResponse.json(), words: (await wordsResponse.json()).map((row) => row.word) };
+  if (!schoolsResponse.ok) throw new Error(await schoolsResponse.text());
+  if (!classesResponse.ok) throw new Error(await classesResponse.text());
+  return {
+    students: await studentsResponse.json(),
+    words: (await wordsResponse.json()).map((row) => row.word),
+    schools: await schoolsResponse.json(),
+    classes: await classesResponse.json(),
+  };
 }
 
 async function handleData(request, env) {
@@ -232,9 +241,38 @@ async function handleData(request, env) {
       if (!recordsResponse.ok) throw new Error(await recordsResponse.text());
       return json({ ...shared, records: await recordsResponse.json() });
     }
+    if (body.action === "addSchool") {
+      const name = String(body.name || "").trim().slice(0, 80);
+      if (!name) return json({ error: "학교 이름을 입력해 주세요." }, 400);
+      const response = await supabaseApi(env, "schools", "", { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify({ name, active: true }) });
+      if (response.status === 409) return json({ error: "이미 등록된 학교예요." }, 409);
+      if (!response.ok) throw new Error(await response.text());
+      return json({ school: (await response.json())[0] });
+    }
+    if (body.action === "addClass") {
+      const schoolId = Number(body.classroom?.schoolId), grade = Number(body.classroom?.grade), name = String(body.classroom?.name || "").trim().slice(0, 40);
+      if (!schoolId || grade < 1 || grade > 12 || !name) return json({ error: "학교, 학년, 반 이름을 확인해 주세요." }, 400);
+      const response = await supabaseApi(env, "classes", "", { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify({ school_id: schoolId, grade, name, active: true }) });
+      if (response.status === 409) return json({ error: "이미 등록된 반이에요." }, 409);
+      if (!response.ok) throw new Error(await response.text());
+      return json({ classroom: (await response.json())[0] });
+    }
     if (body.action === "addStudent") {
-      const student = body.student || {}, code = randomAnimalCode();
-      const payload = { school: String(student.school || "").trim().slice(0, 80), grade: Number(student.grade), room: String(student.room || "").trim().slice(0, 40), name: String(student.name || "").trim().slice(0, 30), animal_code: code, active: true };
+      const student = body.student || {}, classroomId = Number(student.classroomId);
+      const classResponse = await supabaseApi(env, "classes", `?select=id,school_id,grade,name,active&id=eq.${classroomId}&limit=1`);
+      if (!classResponse.ok) throw new Error(await classResponse.text());
+      const classroom = (await classResponse.json())[0];
+      if (!classroom?.active) return json({ error: "등록할 반을 다시 선택해 주세요." }, 400);
+      const schoolResponse = await supabaseApi(env, "schools", `?select=id,name,active&id=eq.${classroom.school_id}&limit=1`);
+      if (!schoolResponse.ok) throw new Error(await schoolResponse.text());
+      const school = (await schoolResponse.json())[0];
+      if (!school?.active) return json({ error: "등록할 학교를 다시 선택해 주세요." }, 400);
+      const usedResponse = await supabaseApi(env, "students", `?select=animal_code&school=eq.${encodeURIComponent(school.name)}&room=eq.${encodeURIComponent(classroom.name)}`);
+      if (!usedResponse.ok) throw new Error(await usedResponse.text());
+      const used = new Set((await usedResponse.json()).map((row) => row.animal_code.join()));
+      let code = randomAnimalCode(), tries = 0;
+      while ((code.length !== 3 || used.has(code.join())) && tries++ < 100) code = randomAnimalCode();
+      const payload = { school: school.name, grade: classroom.grade, room: classroom.name, name: String(student.name || "").trim().slice(0, 30), animal_code: code, active: true };
       if (!payload.school || !payload.room || !payload.name || payload.grade < 1 || payload.grade > 12 || code.length !== 3) return json({ error: "학생 정보를 다시 확인해 주세요." }, 400);
       const response = await supabaseApi(env, "students", "", { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify(payload) });
       if (response.status === 409) return json({ error: "같은 학교와 반에 이미 등록된 이름이에요." }, 409);
