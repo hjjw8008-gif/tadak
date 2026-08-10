@@ -6,6 +6,10 @@ export default {
       return handleRooms(request, env, url);
     }
 
+    if (url.pathname === "/api/records") {
+      return handleRecords(request, env);
+    }
+
     if (!env.ASSETS || typeof env.ASSETS.fetch !== "function") {
       return new Response("Static asset binding is unavailable.", { status: 503 });
     }
@@ -122,4 +126,70 @@ async function handleRooms(request, env, url) {
   }
 
   return json({ error: "지원하지 않는 요청이에요." }, 405);
+}
+
+async function sha256(value) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function validStudent(student) {
+  const students = {
+    1: { name: "김민준", code: [0, 2, 5] },
+    2: { name: "이서윤", code: [3, 8, 12] },
+    3: { name: "박지호", code: [6, 1, 15] },
+  };
+  const expected = students[Number(student?.id)];
+  return Boolean(expected && expected.name === student?.name && Array.isArray(student?.code) && expected.code.join() === student.code.map(Number).join());
+}
+
+async function supabaseRecords(env, path, options = {}) {
+  if (!env.SUPABASE_URL || !env.SUPABASE_PUBLISHABLE_KEY || !env.SUPABASE_APP_SECRET) throw new Error("Supabase 설정이 준비되지 않았어요.");
+  return fetch(`${env.SUPABASE_URL}/rest/v1/practice_records${path}`, {
+    ...options,
+    headers: {
+      apikey: env.SUPABASE_PUBLISHABLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_PUBLISHABLE_KEY}`,
+      "x-app-api-key": env.SUPABASE_APP_SECRET,
+      "Content-Type": "application/json",
+      ...(options.headers || {}),
+    },
+  });
+}
+
+async function handleRecords(request, env) {
+  if (request.method !== "POST") return json({ error: "지원하지 않는 요청이에요." }, 405);
+  try {
+    const body = await request.json();
+    if (body.action === "verifyAdmin" || body.action === "adminRecords") {
+      if (!env.ADMIN_PASSWORD_HASH || await sha256(String(body.password || "")) !== env.ADMIN_PASSWORD_HASH) return json({ error: "관리자 비밀번호가 맞지 않아요." }, 401);
+      if (body.action === "verifyAdmin") return json({ ok: true });
+      const response = await supabaseRecords(env, "?select=*&order=created_at.desc&limit=500");
+      if (!response.ok) throw new Error(await response.text());
+      return json({ records: await response.json() });
+    }
+
+    if (!validStudent(body.student)) return json({ error: "학생 인증 정보가 맞지 않아요." }, 401);
+    if (body.action === "studentRecords") {
+      const response = await supabaseRecords(env, `?select=*&student_id=eq.${Number(body.student.id)}&order=created_at.desc&limit=100`);
+      if (!response.ok) throw new Error(await response.text());
+      return json({ records: await response.json() });
+    }
+    if (body.action === "save") {
+      const record = body.record || {}, payload = {
+        client_id: String(record.clientId || "").slice(0, 100), student_id: Number(body.student.id), student_name: body.student.name,
+        activity_type: String(record.type || "").slice(0, 50), accuracy: Math.max(0, Math.min(100, Number(record.accuracy) || 0)),
+        cpm: Math.max(0, Math.min(2000, Number(record.cpm) || 0)), score: Math.max(0, Math.min(1000000, Number(record.score) || 0)),
+        details: record.details && typeof record.details === "object" ? record.details : {},
+      };
+      if (!payload.client_id || !payload.activity_type) return json({ error: "저장할 기록이 올바르지 않아요." }, 400);
+      const response = await supabaseRecords(env, "?on_conflict=client_id", { method: "POST", headers: { Prefer: "resolution=ignore-duplicates,return=minimal" }, body: JSON.stringify(payload) });
+      if (!response.ok) throw new Error(await response.text());
+      return json({ ok: true });
+    }
+    return json({ error: "지원하지 않는 요청이에요." }, 400);
+  } catch (error) {
+    console.error("records", error);
+    return json({ error: "공용 기록을 처리하지 못했어요." }, 500);
+  }
 }
