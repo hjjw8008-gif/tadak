@@ -10,6 +10,10 @@ export default {
       return handleRecords(request, env);
     }
 
+    if (url.pathname === "/api/data") {
+      return handleData(request, env);
+    }
+
     if (!env.ASSETS || typeof env.ASSETS.fetch !== "function") {
       return new Response("Static asset binding is unavailable.", { status: 503 });
     }
@@ -133,19 +137,9 @@ async function sha256(value) {
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-function validStudent(student) {
-  const students = {
-    1: { name: "김민준", code: [0, 2, 5] },
-    2: { name: "이서윤", code: [3, 8, 12] },
-    3: { name: "박지호", code: [6, 1, 15] },
-  };
-  const expected = students[Number(student?.id)];
-  return Boolean(expected && expected.name === student?.name && Array.isArray(student?.code) && expected.code.join() === student.code.map(Number).join());
-}
-
-async function supabaseRecords(env, path, options = {}) {
+async function supabaseApi(env, table, path = "", options = {}) {
   if (!env.SUPABASE_URL || !env.SUPABASE_PUBLISHABLE_KEY || !env.SUPABASE_APP_SECRET) throw new Error("Supabase 설정이 준비되지 않았어요.");
-  return fetch(`${env.SUPABASE_URL}/rest/v1/practice_records${path}`, {
+  return fetch(`${env.SUPABASE_URL}/rest/v1/${table}${path}`, {
     ...options,
     headers: {
       apikey: env.SUPABASE_PUBLISHABLE_KEY,
@@ -155,6 +149,20 @@ async function supabaseRecords(env, path, options = {}) {
       ...(options.headers || {}),
     },
   });
+}
+
+const supabaseRecords = (env, path, options = {}) => supabaseApi(env, "practice_records", path, options);
+
+async function validStudent(student, env) {
+  if (!student || !Array.isArray(student.code)) return false;
+  const response = await supabaseApi(env, "students", `?select=id,name,animal_code,active&id=eq.${Number(student.id)}&limit=1`);
+  if (!response.ok) throw new Error(await response.text());
+  const expected = (await response.json())[0];
+  return Boolean(expected && expected.active && expected.name === student.name && expected.animal_code.join() === student.code.map(Number).join());
+}
+
+async function validAdmin(body, env) {
+  return Boolean(env.ADMIN_PASSWORD_HASH && await sha256(String(body.password || "")) === env.ADMIN_PASSWORD_HASH);
 }
 
 async function handleRecords(request, env) {
@@ -169,7 +177,7 @@ async function handleRecords(request, env) {
       return json({ records: await response.json() });
     }
 
-    if (!validStudent(body.student)) return json({ error: "학생 인증 정보가 맞지 않아요." }, 401);
+    if (!await validStudent(body.student, env)) return json({ error: "학생 인증 정보가 맞지 않아요." }, 401);
     if (body.action === "studentRecords") {
       const response = await supabaseRecords(env, `?select=*&student_id=eq.${Number(body.student.id)}&order=created_at.desc&limit=100`);
       if (!response.ok) throw new Error(await response.text());
@@ -191,5 +199,64 @@ async function handleRecords(request, env) {
   } catch (error) {
     console.error("records", error);
     return json({ error: "공용 기록을 처리하지 못했어요." }, 500);
+  }
+}
+
+function randomAnimalCode() {
+  const values = new Uint32Array(20);
+  crypto.getRandomValues(values);
+  return [...values].map((value) => value % 20).filter((value, index, all) => all.indexOf(value) === index).slice(0, 3);
+}
+
+async function readSharedData(env, includeCodes = false) {
+  const studentFields = includeCodes ? "id,school,grade,room,name,animal_code,active" : "id,school,grade,room,name,active";
+  const [studentsResponse, wordsResponse] = await Promise.all([
+    supabaseApi(env, "students", `?select=${studentFields}&order=school.asc,room.asc,name.asc`),
+    supabaseApi(env, "typing_words", "?select=word&active=eq.true&order=id.asc"),
+  ]);
+  if (!studentsResponse.ok) throw new Error(await studentsResponse.text());
+  if (!wordsResponse.ok) throw new Error(await wordsResponse.text());
+  return { students: await studentsResponse.json(), words: (await wordsResponse.json()).map((row) => row.word) };
+}
+
+async function handleData(request, env) {
+  if (request.method !== "POST") return json({ error: "지원하지 않는 요청이에요." }, 405);
+  try {
+    const body = await request.json();
+    if (body.action === "bootstrap") return json(await readSharedData(env, false));
+    if (body.action === "verifyStudent") return await validStudent(body.student, env) ? json({ ok: true }) : json({ error: "동물 비밀번호가 맞지 않아요." }, 401);
+    if (!await validAdmin(body, env)) return json({ error: "관리자 비밀번호가 맞지 않아요." }, 401);
+
+    if (body.action === "adminData") {
+      const [shared, recordsResponse] = await Promise.all([readSharedData(env, true), supabaseRecords(env, "?select=*&order=created_at.desc&limit=500")]);
+      if (!recordsResponse.ok) throw new Error(await recordsResponse.text());
+      return json({ ...shared, records: await recordsResponse.json() });
+    }
+    if (body.action === "addStudent") {
+      const student = body.student || {}, code = randomAnimalCode();
+      const payload = { school: String(student.school || "").trim().slice(0, 80), grade: Number(student.grade), room: String(student.room || "").trim().slice(0, 40), name: String(student.name || "").trim().slice(0, 30), animal_code: code, active: true };
+      if (!payload.school || !payload.room || !payload.name || payload.grade < 1 || payload.grade > 12 || code.length !== 3) return json({ error: "학생 정보를 다시 확인해 주세요." }, 400);
+      const response = await supabaseApi(env, "students", "", { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify(payload) });
+      if (response.status === 409) return json({ error: "같은 학교와 반에 이미 등록된 이름이에요." }, 409);
+      if (!response.ok) throw new Error(await response.text());
+      return json({ student: (await response.json())[0] });
+    }
+    if (body.action === "toggleStudent") {
+      const response = await supabaseApi(env, "students", `?id=eq.${Number(body.id)}`, { method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify({ active: Boolean(body.active) }) });
+      if (!response.ok) throw new Error(await response.text());
+      const student = (await response.json())[0];
+      return student ? json({ student }) : json({ error: "학생을 찾을 수 없어요." }, 404);
+    }
+    if (body.action === "addWord") {
+      const word = String(body.word || "").trim();
+      if (!/^[가-힣]{1,10}$/.test(word)) return json({ error: "한글 1~10글자로 입력해 주세요." }, 400);
+      const response = await supabaseApi(env, "typing_words", "?on_conflict=word", { method: "POST", headers: { Prefer: "resolution=ignore-duplicates,return=minimal" }, body: JSON.stringify({ word, active: true }) });
+      if (!response.ok) throw new Error(await response.text());
+      return json(await readSharedData(env, false));
+    }
+    return json({ error: "지원하지 않는 요청이에요." }, 400);
+  } catch (error) {
+    console.error("shared-data", error);
+    return json({ error: "공용 학생·단어 데이터를 처리하지 못했어요." }, 500);
   }
 }
